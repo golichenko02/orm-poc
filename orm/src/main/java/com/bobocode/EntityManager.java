@@ -5,7 +5,8 @@ import com.bobocode.annotation.Id;
 import com.bobocode.annotation.Table;
 import com.bobocode.exception.DaoOperationException;
 import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.sql.DataSource;
 import java.lang.reflect.Field;
@@ -17,22 +18,30 @@ import java.sql.SQLException;
 import java.util.Arrays;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
 @RequiredArgsConstructor
 public class EntityManager {
+    private static final Logger log = LoggerFactory.getLogger(EntityManager.class);
     private static final String SELECT_SQL = "SELECT * FROM %s WHERE %s = ?";
     private static final String SELECT_UUID_SQL = "SELECT * FROM %s WHERE %s = uuid(?)";
 
     private final DataSource dataSource;
+    private final Map<EntityKey<?>, Object> entityByEntityKeyCache = new ConcurrentHashMap<>();
 
     public <T> T find(Class<? extends T> entityClass, Object primaryKey) {
-        return findEntity(entityClass, primaryKey);
+        EntityKey<? extends T> entityKey = new EntityKey<>(entityClass, primaryKey);
+        return entityClass.cast(entityByEntityKeyCache.computeIfAbsent(entityKey, this::findEntity));
     }
 
-    private <T> T findEntity(Class<? extends T> entityClass, Object primaryKey) {
+    private <T> T findEntity(EntityKey<? extends T> entityKey) {
+        log.trace("Not found entity in the cache by key [{}]", entityKey);
+        Class<? extends T> entityClass = entityKey.getEntityClass();
+        Object primaryKey = entityKey.getId();
         String sql = prepareSqlQuery(entityClass, primaryKey);
+        log.trace("Query: [{}]", sql);
         try (Connection connection = getConnection();
              PreparedStatement preparedStatement = connection.prepareStatement(sql)) {
             preparedStatement.setObject(1, primaryKey);
