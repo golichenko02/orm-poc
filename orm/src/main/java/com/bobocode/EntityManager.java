@@ -1,9 +1,9 @@
 package com.bobocode;
 
 import com.bobocode.annotation.Column;
-import com.bobocode.annotation.Id;
-import com.bobocode.annotation.Table;
 import com.bobocode.exception.DaoOperationException;
+import com.bobocode.utils.ReflectionUtils;
+import com.bobocode.utils.SqlBuilder;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -11,25 +11,17 @@ import org.slf4j.LoggerFactory;
 import javax.sql.DataSource;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.util.Arrays;
-import java.util.Map;
-import java.util.UUID;
+import java.sql.*;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Function;
-import java.util.stream.Collectors;
 
 @RequiredArgsConstructor
-public class EntityManager {
+public class EntityManager implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(EntityManager.class);
-    private static final String SELECT_SQL = "SELECT * FROM %s WHERE %s = ?";
-    private static final String SELECT_UUID_SQL = "SELECT * FROM %s WHERE %s = uuid(?)";
 
     private final DataSource dataSource;
     private final Map<EntityKey<?>, Object> entityByEntityKeyCache = new ConcurrentHashMap<>();
+    private final Map<EntityKey<?>, Object[]> entityInitialStateByEntityKey = new ConcurrentHashMap<>();
 
     public <T> T find(Class<? extends T> entityClass, Object primaryKey) {
         EntityKey<? extends T> entityKey = new EntityKey<>(entityClass, primaryKey);
@@ -40,35 +32,100 @@ public class EntityManager {
         log.trace("Not found entity in the cache by key [{}]", entityKey);
         Class<? extends T> entityClass = entityKey.getEntityClass();
         Object primaryKey = entityKey.getId();
-        String sql = prepareSqlQuery(entityClass, primaryKey);
+        String sql = SqlBuilder.prepareSelectQuery(entityClass);
         log.trace("Query: [{}]", sql);
+        T result = executeQuery(entityKey, sql, primaryKey);
+        saveEntitySnapshot(entityKey, result);
+        return result;
+    }
+
+    private <T> void saveEntitySnapshot(EntityKey<? extends T> entityKey, T entity) {
+        Object[] values = ReflectionUtils.getEntityColumnValues(entity);
+        entityInitialStateByEntityKey.put(entityKey, values);
+    }
+
+    @Override
+    public void close() {
+        executeDirtyCheck();
+        entityByEntityKeyCache.clear();
+        entityInitialStateByEntityKey.clear();
+    }
+
+    private void executeDirtyCheck() {
+        entityByEntityKeyCache.keySet().stream()
+                .filter(this::hasChanged)
+                .forEach(this::flushChanges);
+    }
+
+    private <T> boolean hasChanged(EntityKey<T> entityKey) {
+        Object[] currentEntityState = ReflectionUtils.getEntityColumnValues(entityByEntityKeyCache.get(entityKey));
+        Object[] initialEntityState = entityInitialStateByEntityKey.get(entityKey);
+        return !Arrays.equals(currentEntityState, initialEntityState);
+    }
+
+    private <T> void flushChanges(EntityKey<T> entityKey) {
+        log.trace("Found not flushed changes in the cache");
+        Class<T> entityClass = entityKey.getEntityClass();
+        T updatedEntity = entityClass.cast(entityByEntityKeyCache.get(entityKey));
+        String updateSql = SqlBuilder.prepareUpdateQuery(entityKey);
+        log.trace("Update entity: [{}]", updateSql);
+        executeUpdateQuery(updateSql, entityKey.getId(), ReflectionUtils.getEntityColumnValuesWithoutId(updatedEntity));
+    }
+
+    private <T> T executeQuery(EntityKey<T> entityKey, String sql, Object... parameters) {
         try (Connection connection = getConnection();
              PreparedStatement preparedStatement = connection.prepareStatement(sql)) {
-            preparedStatement.setObject(1, primaryKey);
-            ResultSet resultSet = preparedStatement.executeQuery();
-            return parseResultSet(entityClass, resultSet);
+            SqlBuilder.setParameters(preparedStatement, entityKey.getId());
+            return parseResultSet(entityKey, preparedStatement.executeQuery());
         } catch (SQLException e) {
-            throw new DaoOperationException("Failed to retrieve entity by id: %s".formatted(primaryKey), e);
+            throw new DaoOperationException("Failed to execute query: [%s] with parameters [%s]"
+                    .formatted(sql, Arrays.toString(parameters)), e);
         }
     }
 
-    private <T> T parseResultSet(Class<? extends T> entityClass, ResultSet resultSet) throws SQLException {
-        if (!resultSet.next()) {
-            throw new DaoOperationException("No data found");
+    private long executeUpdateQuery(String sql, Object pk, Object... parameters) {
+        try (Connection connection = getConnection();
+             PreparedStatement preparedStatement = connection.prepareStatement(sql)) {
+            SqlBuilder.setParameters(preparedStatement, pk, parameters);
+            return preparedStatement.executeUpdate();
+        } catch (SQLException e) {
+            throw new DaoOperationException("Failed to execute update query: [%s] with parameters %s"
+                    .formatted(sql, Arrays.toString(parameters)), e);
         }
+    }
 
+    private <T> T parseResultSet(EntityKey<? extends T> entityKey, ResultSet resultSet) {
+        moveResultSetCursor(resultSet);
+
+        Class<? extends T> entityClass = entityKey.getEntityClass();
         checkDefaultConstructor(entityClass);
         T entity = createEntity(entityClass);
 
-        Map<String, Field> fieldByColumnName = getEntityColumns(entityClass);
-        for (Map.Entry<String, Field> fieldByColumnNameEntry : fieldByColumnName.entrySet()) {
-            String columnName = fieldByColumnNameEntry.getKey();
-            Field field = fieldByColumnNameEntry.getValue();
-            Object value = resultSet.getObject(columnName);
-            setFieldValue(entity, field, value);
-        }
+        List<Field> fields = ReflectionUtils.getEntityColumns(entityClass);
+        fields.forEach(field -> fillEntityField(resultSet, field, entity));
+
 
         return entity;
+    }
+
+    private static void moveResultSetCursor(ResultSet resultSet) {
+        try {
+            if (!resultSet.next()) {
+                throw new DaoOperationException("No data found");
+            }
+        } catch (SQLException e) {
+            throw new DaoOperationException("Failed to move cursor for ResultSet", e);
+        }
+    }
+
+    private static <T> void fillEntityField(ResultSet resultSet, Field field, T entity) {
+        try {
+            String columnName = field.getAnnotation(Column.class).name();
+            Object value = resultSet.getObject(columnName);
+            setFieldValue(entity, field, value);
+        } catch (SQLException e) {
+            throw new DaoOperationException("Failed to parse ResultSet", e);
+        }
     }
 
     private static <T> void setFieldValue(T entity, Field field, Object value) {
@@ -80,11 +137,6 @@ public class EntityManager {
         }
     }
 
-    private <T> Map<String, Field> getEntityColumns(Class<? extends T> entityClass) {
-        return Arrays.stream(entityClass.getDeclaredFields())
-                .filter(field -> field.isAnnotationPresent(Column.class))
-                .collect(Collectors.toMap(field -> field.getAnnotation(Column.class).name(), Function.identity()));
-    }
 
     private <T> T createEntity(Class<? extends T> entityClass) {
         try {
@@ -97,39 +149,9 @@ public class EntityManager {
     }
 
     private <T> void checkDefaultConstructor(Class<? extends T> entityClass) {
-        boolean isDefaultConstructorExists = Arrays.stream(entityClass.getDeclaredConstructors())
-                .anyMatch(constructor -> constructor.getParameterCount() == 0);
-
-        if (!isDefaultConstructorExists) {
+        if (!ReflectionUtils.isDefaultConstructorPresent(entityClass)) {
             throw new DaoOperationException("Could instantiate entity %s. No default constructor declared".formatted(entityClass.getSimpleName()));
         }
-    }
-
-    private <T> String prepareSqlQuery(Class<? extends T> entityClass, Object primaryKey) {
-        if (!entityClass.isAnnotationPresent(Table.class)) {
-            throw new RuntimeException();
-        }
-        String tableName = entityClass.getAnnotation(Table.class).name();
-        String pk = findPrimaryKeyName(entityClass);
-        return UUID.class.isAssignableFrom(getFieldType(entityClass, pk)) ?
-                SELECT_UUID_SQL.formatted(tableName, pk) :
-                SELECT_SQL.formatted(tableName, pk);
-    }
-
-    private static <T> Class<?> getFieldType(Class<? extends T> entityClass, String fieldName) {
-        try {
-            return entityClass.getDeclaredField(fieldName).getType();
-        } catch (NoSuchFieldException e) {
-            throw new DaoOperationException("Failed to get field by name [%s]".formatted(fieldName), e);
-        }
-    }
-
-    private <T> String findPrimaryKeyName(Class<? extends T> entityClass) {
-        return Arrays.stream(entityClass.getDeclaredFields())
-                .filter(field -> field.isAnnotationPresent(Id.class) && field.isAnnotationPresent(Column.class))
-                .findFirst()
-                .map(field -> field.getAnnotation(Column.class).name())
-                .orElseThrow(() -> new DaoOperationException("Primary key column is not specified"));
     }
 
     private Connection getConnection() {
